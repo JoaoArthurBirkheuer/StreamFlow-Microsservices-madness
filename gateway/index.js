@@ -102,7 +102,7 @@ app.register(proxy, {
 
 // Analytics — protegido
 app.register(proxy, {
-  upstream: process.env.ANALYTICS_SERVICE_URL || 'http://localhost:3007',
+  upstream: process.env.BILLING_SERVICE_URL || 'http://localhost:3006',
   prefix: '/api/analytics',
   rewritePrefix: '/analytics',
   preHandler: authenticateJWT,
@@ -116,8 +116,7 @@ app.get('/health', async (request, reply) => {
     'streaming-service': process.env.STREAMING_SERVICE_URL || 'http://localhost:3003',
     'recommendation-service': process.env.RECOMMENDATION_SERVICE_URL || 'http://localhost:3004',
     'notification-service': process.env.NOTIFICATION_SERVICE_URL || 'http://localhost:3005',
-    'billing-service': process.env.BILLING_SERVICE_URL || 'http://localhost:3006',
-    'analytics-service': process.env.ANALYTICS_SERVICE_URL || 'http://localhost:3007',
+    'billing-analytics-service': process.env.BILLING_SERVICE_URL || 'http://localhost:3006',
   };
 
   const results = {};

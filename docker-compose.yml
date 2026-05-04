@@ -20,7 +20,6 @@ services:
       - recommendation-service
       - notification-service
       - billing-service
-      - analytics-service
     environment:
       - PORT=8080
       - AUTH_SERVICE_URL=http://auth-service:3001
@@ -29,7 +28,6 @@ services:
       - RECOMMENDATION_SERVICE_URL=http://recommendation-service:3004
       - NOTIFICATION_SERVICE_URL=http://notification-service:3005
       - BILLING_SERVICE_URL=http://billing-service:3006
-      - ANALYTICS_SERVICE_URL=http://analytics-service:3007
       - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
     volumes:
       - ./keys:/app/keys:ro
@@ -113,28 +111,11 @@ services:
 
   # ── Billing Service ──────────────────────────────────────────
   billing-service:
-    build: ./services/billing
+    build: ./services/billing-analytics
     expose:
       - "3006"
     environment:
       - PORT=3006
-      - DB_PATH=/app/data/shared_billing.db
-      - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
-    volumes:
-      - shared-billing-data:/app/data
-      - ./keys:/app/keys:ro
-    networks:
-      - streamflow-net
-
-  # ── Analytics Service ────────────────────────────────────────
-  # NOTA: Este serviço compartilha o MESMO volume de dados
-  #       do billing-service (shared-billing-data).
-  analytics-service:
-    build: ./services/analytics
-    expose:
-      - "3007"
-    environment:
-      - PORT=3007
       - DB_PATH=/app/data/shared_billing.db
       - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
     volumes:
