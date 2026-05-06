@@ -115,7 +115,6 @@ app.get('/health', async (request, reply) => {
     'catalog-service': process.env.CATALOG_SERVICE_URL || 'http://localhost:3002',
     'streaming-service': process.env.STREAMING_SERVICE_URL || 'http://localhost:3003',
     'recommendation-service': process.env.RECOMMENDATION_SERVICE_URL || 'http://localhost:3004',
-    'notification-service': process.env.NOTIFICATION_SERVICE_URL || 'http://localhost:3005',
     'billing-analytics-service': process.env.BILLING_SERVICE_URL || 'http://localhost:3006',
   };
 
