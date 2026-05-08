@@ -1,19 +1,44 @@
 /**
  * StreamFlow — Catalog Service
- *
- * Gerencia o catálogo de filmes e séries.
- * Banco de dados próprio (catalog.db).
+ * Gerencia o catálogo de filmes e séries com banco de dados próprio (catalog.db).
  */
 
+// 1. INSTRUMENTAÇÃO OPENTELEMETRY (Novo Padrão)
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
+
+const sdk = new NodeSDK({
+  serviceName: 'catalog-service',
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://jaeger:4318/v1/traces',
+  }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+
+sdk.start();
+
+// 2. DEPENDÊNCIAS
 const Fastify = require('fastify');
 const Database = require('better-sqlite3');
+const metricsPlugin = require('fastify-metrics');
 
-const app = Fastify({ logger: true });
+const app = Fastify({ 
+  logger: {
+    transport: {
+      target: 'pino-pretty',
+      options: { colorize: true }
+    }
+  } 
+});
+
+// Registro de métricas para o Prometheus
+app.register(metricsPlugin, { endpoint: '/metrics' });
 
 const PORT = process.env.PORT || 3002;
 const DB_PATH = process.env.DB_PATH || './data/catalog.db';
 
-// ── Banco de dados ──────────────────────────────────────────
+// ── Banco de dados (Lógica Original Restaurada) ────────────────
 const db = new Database(DB_PATH);
 
 db.exec(`
@@ -28,7 +53,7 @@ db.exec(`
   )
 `);
 
-// Seed
+// Seed de dados originais
 const count = db.prepare('SELECT COUNT(*) as total FROM movies').get();
 if (count.total === 0) {
   const insert = db.prepare(
@@ -56,7 +81,7 @@ if (count.total === 0) {
 
 // ── Rotas ───────────────────────────────────────────────────
 
-// GET /catalog — listar todo o catálogo
+// GET /catalog — listar todo o catálogo com filtros
 app.get('/catalog', async (request) => {
   const { genre, year } = request.query;
   let query = 'SELECT * FROM movies WHERE 1=1';
@@ -92,10 +117,25 @@ app.get('/health', async () => ({
   service: 'catalog-service',
   uptime: process.uptime(),
   timestamp: new Date().toISOString(),
+  observability: 'instrumented'
 }));
 
 // ── Inicialização ───────────────────────────────────────────
-app.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
-  if (err) { app.log.error(err); process.exit(1); }
-  app.log.info(`catalog-service rodando na porta ${PORT}`);
+const start = async () => {
+  try {
+    await app.listen({ port: PORT, host: '0.0.0.0' });
+    app.log.info(`catalog-service rodando na porta ${PORT}`);
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+};
+
+// Shutdown gracioso
+process.on('SIGTERM', () => {
+  sdk.shutdown()
+    .then(() => console.log('SDK de Tracing do Catalog finalizado'))
+    .finally(() => process.exit(0));
 });
+
+start();

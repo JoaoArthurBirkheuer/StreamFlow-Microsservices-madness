@@ -1,18 +1,34 @@
 /**
- * StreamFlow — API Gateway
+ * StreamFlow — API Gateway (Instrumentado)
  *
  * Ponto de entrada único para todos os microsserviços.
- * Responsabilidades:
- *   - Roteamento de requisições para serviços internos
- *   - Autenticação JWT centralizada (chave pública RS256)
- *   - Logging estruturado (Pino, nativo do Fastify)
- *   - Health check agregado
+ * Implementa:
+ * - OpenTelemetry (Tracing Distribuído - Novo Padrão)
+ * - Fastify Metrics (Métricas para Prometheus)
+ * - Roteamento via Proxy
+ * - Autenticação JWT RS256
  */
+
+// 1. INSTRUMENTAÇÃO OPENTELEMETRY (Iniciando no topo com o novo padrão)
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
+
+const sdk = new NodeSDK({
+  serviceName: 'api-gateway',
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://jaeger:4318/v1/traces',
+  }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+
+sdk.start();
 
 const Fastify = require('fastify');
 const proxy = require('@fastify/http-proxy');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
+const metricsPlugin = require('fastify-metrics'); // Plugin de métricas
 
 const app = Fastify({
   logger: {
@@ -24,91 +40,92 @@ const app = Fastify({
   }
 });
 
+// Registro de métricas para o Prometheus
+app.register(metricsPlugin, { endpoint: '/metrics' });
+
 const PORT = process.env.PORT || 8080;
 
-// ── Chave pública para validação JWT ────────────────────────
+// Carregamento da Chave Pública para Verificação JWT
 let PUBLIC_KEY;
 try {
-  PUBLIC_KEY = fs.readFileSync(
-    process.env.JWT_PUBLIC_KEY_PATH || './keys/public.pem',
-    'utf8'
-  );
+  PUBLIC_KEY = fs.readFileSync(process.env.JWT_PUBLIC_KEY_PATH || './keys/public.pem', 'utf8');
 } catch (err) {
-  app.log.warn('Chave pública JWT não encontrada — autenticação desabilitada');
+  app.log.warn('Chave pública JWT não encontrada. Autenticação externa falhará.');
 }
 
-// ── Hook de autenticação JWT ────────────────────────────────
-// Usado como preHandler nas rotas que exigem autenticação
+/**
+ * Middleware de Autenticação
+ */
 async function authenticateJWT(request, reply) {
   const authHeader = request.headers.authorization;
+
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return reply.code(401).send({ error: 'Token não fornecido.' });
+    return reply.code(401).send({ error: 'Token não fornecido ou formato inválido.' });
   }
 
   const token = authHeader.split(' ')[1];
 
   try {
     const decoded = jwt.verify(token, PUBLIC_KEY, { algorithms: ['RS256'] });
+    // Injeta dados do usuário nos headers para os serviços downstream
     request.headers['x-user-id'] = decoded.sub;
     request.headers['x-user-role'] = decoded.role;
+    request.headers['x-user-name'] = decoded.name;
   } catch (err) {
-    if (err.name === 'TokenExpiredError') {
-      return reply.code(401).send({ error: 'Token expirado.' });
-    }
-    return reply.code(403).send({ error: 'Token inválido.' });
+    return reply.code(401).send({ error: 'Token inválido ou expirado.' });
   }
 }
 
-// ── Rotas de proxy ──────────────────────────────────────────
+// ── Roteamento via Proxy (MANTIDO CONFORME ORIGINAL) ───────────────────────
 
-// Auth — público (login não exige token)
+// Auth Service (Público)
 app.register(proxy, {
   upstream: process.env.AUTH_SERVICE_URL || 'http://localhost:3001',
   prefix: '/auth',
   rewritePrefix: '',
 });
 
-// Catalog — protegido
+// Catalog Service (Protegido)
 app.register(proxy, {
   upstream: process.env.CATALOG_SERVICE_URL || 'http://localhost:3002',
   prefix: '/api/catalog',
   rewritePrefix: '/catalog',
-  preHandler: authenticateJWT,
+  preHandler: authenticateJWT
 });
 
-// Streaming — protegido
+// Streaming Service (Protegido)
 app.register(proxy, {
   upstream: process.env.STREAMING_SERVICE_URL || 'http://localhost:3003',
   prefix: '/api/streaming',
   rewritePrefix: '/streaming',
-  preHandler: authenticateJWT,
+  preHandler: authenticateJWT
 });
 
-// Recommendations — protegido
+// Recommendation Service (Protegido)
 app.register(proxy, {
   upstream: process.env.RECOMMENDATION_SERVICE_URL || 'http://localhost:3004',
   prefix: '/api/recommendations',
   rewritePrefix: '/recommendations',
-  preHandler: authenticateJWT,
+  preHandler: authenticateJWT
 });
 
-// Billing — protegido
+// Billing & Analytics Service (Protegido)
 app.register(proxy, {
   upstream: process.env.BILLING_SERVICE_URL || 'http://localhost:3006',
   prefix: '/api/billing',
   rewritePrefix: '/billing',
-  preHandler: authenticateJWT,
+  preHandler: authenticateJWT
 });
 
-// Analytics — protegido
 app.register(proxy, {
   upstream: process.env.BILLING_SERVICE_URL || 'http://localhost:3006',
   prefix: '/api/analytics',
   rewritePrefix: '/analytics',
-  preHandler: authenticateJWT,
+  preHandler: authenticateJWT
 });
 
-// ── Health check agregado ───────────────────────────────────
+// ── Health Check Agregado ────────────────────────────────────────────────
+
 app.get('/health', async (request, reply) => {
   const services = {
     'auth-service': process.env.AUTH_SERVICE_URL || 'http://localhost:3001',
@@ -143,10 +160,21 @@ app.get('/health', async (request, reply) => {
 });
 
 // ── Inicialização ───────────────────────────────────────────
-app.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
-  if (err) {
+const start = async () => {
+  try {
+    await app.listen({ port: PORT, host: '0.0.0.0' });
+    app.log.info(`Gateway operando na porta ${PORT}`);
+  } catch (err) {
     app.log.error(err);
     process.exit(1);
   }
-  app.log.info(`StreamFlow Gateway operando na porta ${PORT}`);
+};
+
+// Shutdown gracioso
+process.on('SIGTERM', () => {
+  sdk.shutdown()
+    .then(() => app.log.info('SDK de Tracing finalizado'))
+    .finally(() => process.exit(0));
 });
+
+start();
