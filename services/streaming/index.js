@@ -1,136 +1,145 @@
 /**
  * StreamFlow — Streaming Service
- *
- * Gerencia sessões de reprodução de conteúdo.
- *
- * ⚠️  ANTIPATTERN: Cadeia síncrona obrigatória
- *     Quando o usuário clica "Play", este serviço faz chamadas
- *     síncronas em cadeia:
- *       1. catalog-service → verificar licença
- *       2. recommendation-service → registrar visualização
- *       3. notification-service → notificar início de sessão
- *     Todas são bloqueantes — se qualquer uma falhar ou atrasar,
- *     o usuário fica esperando.
+ * Gerencia a execução de títulos e dispara eventos de visualização.
  */
 
+// 1. INSTRUMENTAÇÃO OPENTELEMETRY (Novo Padrão)
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
+
+const sdk = new NodeSDK({
+  serviceName: 'streaming-service',
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://jaeger:4318/v1/traces',
+  }),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+
+sdk.start();
+
+// 2. DEPENDÊNCIAS
 const Fastify = require('fastify');
 const Database = require('better-sqlite3');
+const amqp = require('amqplib');
+const metricsPlugin = require('fastify-metrics');
 
-const app = Fastify({ logger: true });
+const app = Fastify({ 
+  logger: {
+    transport: {
+      target: 'pino-pretty',
+      options: { colorize: true }
+    }
+  } 
+});
+
+// Registro de métricas para o Prometheus
+app.register(metricsPlugin, { endpoint: '/metrics' });
 
 const PORT = process.env.PORT || 3003;
 const DB_PATH = process.env.DB_PATH || './data/streaming.db';
+const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://rabbitmq:5672';
+const CATALOG_SERVICE_URL = process.env.CATALOG_SERVICE_URL || 'http://catalog-service:3002';
 
-const CATALOG_URL = process.env.CATALOG_SERVICE_URL || 'http://localhost:3002';
-const RECOMMENDATION_URL = process.env.RECOMMENDATION_SERVICE_URL || 'http://localhost:3004';
-const NOTIFICATION_URL = process.env.NOTIFICATION_SERVICE_URL || 'http://localhost:3005';
-
-// ── Banco de dados ──────────────────────────────────────────
+// ── Banco de dados (Lógica Original) ───────────────────────
 const db = new Database(DB_PATH);
 
 db.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
+  CREATE TABLE IF NOT EXISTS streams (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
     movie_id INTEGER NOT NULL,
-    started_at TEXT DEFAULT (datetime('now')),
-    duration_seconds INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'active'
+    started_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
 
+// ── Mensageria (Produtor RabbitMQ) ──────────────────────────
+let amqpChannel;
+async function connectRabbitMQ() {
+  try {
+    const connection = await amqp.connect(RABBITMQ_URL);
+    amqpChannel = await connection.createChannel();
+    await amqpChannel.assertQueue('movie_viewed', { durable: true });
+    app.log.info('Conectado ao RabbitMQ (Streaming Producer)');
+  } catch (err) {
+    app.log.error('Erro ao conectar no RabbitMQ, tentando novamente em 5s...');
+    setTimeout(connectRabbitMQ, 5000);
+  }
+}
+
 // ── Rotas ───────────────────────────────────────────────────
 
-// POST /streaming/play — iniciar reprodução
-// Este é o fluxo que demonstra a cadeia síncrona (antipattern)
+// POST /streaming/play — Inicia um filme
 app.post('/streaming/play', async (request, reply) => {
-  const { movieId } = request.body || {};
+  const { movieId } = request.body;
   const userId = request.headers['x-user-id'] || 'anonymous';
 
   if (!movieId) {
     return reply.code(400).send({ error: 'movieId é obrigatório.' });
   }
 
-  app.log.info({ movieId, userId }, 'Iniciando fluxo de play...');
-
-  // ── PASSO 1: Verificar licença no catalog-service (SÍNCRONO) ──
-  let licenseData;
   try {
-    const licenseRes = await fetch(`${CATALOG_URL}/catalog/${movieId}/license`, {
-      signal: AbortSignal.timeout(5000),
-    });
+    // 1. Verifica licença no Catalog Service
+    const licenseRes = await fetch(`${CATALOG_SERVICE_URL}/catalog/${movieId}/license`);
     if (!licenseRes.ok) {
-      return reply.code(404).send({ error: 'Título não encontrado no catálogo.' });
+      return reply.code(404).send({ error: 'Filme não encontrado no catálogo.' });
     }
-    licenseData = await licenseRes.json();
-
+    
+    const licenseData = await licenseRes.json();
     if (!licenseData.licensed) {
-      return reply.code(403).send({ error: 'Licença expirada para este título.' });
+      return reply.code(403).send({ error: 'Este conteúdo não possui licença ativa para exibição.' });
     }
+
+    // 2. Registra o início do stream no DB local
+    const insert = db.prepare('INSERT INTO streams (user_id, movie_id) VALUES (?, ?)');
+    insert.run(userId, movieId);
+
+    // 3. Dispara evento para o RabbitMQ (para Recommendation e Billing)
+    if (amqpChannel) {
+      const event = { userId, movieId, timestamp: new Date().toISOString() };
+      amqpChannel.sendToQueue('movie_viewed', Buffer.from(JSON.stringify(event)), { persistent: true });
+      app.log.info(`Evento movie_viewed enviado para o filme ${movieId}`);
+    }
+
+    return {
+      status: 'playing',
+      movie: licenseData.title,
+      message: 'Stream iniciado com sucesso.'
+    };
+
   } catch (err) {
-    app.log.error({ err }, 'Falha ao verificar licença no catalog-service');
-    return reply.code(503).send({ error: 'Serviço de catálogo indisponível.' });
+    app.log.error(err);
+    return reply.code(500).send({ error: 'Erro interno ao processar streaming.' });
   }
-
-  // ── PASSO 2: Registrar visualização no recommendation-service (SÍNCRONO) ──
-  try {
-    await fetch(`${RECOMMENDATION_URL}/recommendations/viewed`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId, movieId }),
-      signal: AbortSignal.timeout(5000),
-    });
-  } catch (err) {
-    // Falha silenciosa — mas o usuário está esperando
-    app.log.warn({ err }, 'Falha ao registrar visualização no recommendation-service');
-  }
-
-  // ── PASSO 3: Notificar início de sessão (SÍNCRONO — antipattern!) ──
-  try {
-    await fetch(`${NOTIFICATION_URL}/notify`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userId,
-        type: 'session_started',
-        message: `Reprodução iniciada: ${licenseData.title}`,
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
-  } catch (err) {
-    // Falha silenciosa — mas bloqueia o fluxo
-    app.log.warn({ err }, 'Falha ao enviar notificação');
-  }
-
-  // ── PASSO 4: Criar sessão local ──
-  const info = db.prepare(
-    'INSERT INTO sessions (user_id, movie_id) VALUES (?, ?)'
-  ).run(userId, movieId);
-
-  return reply.code(201).send({
-    sessionId: info.lastInsertRowid,
-    movie: licenseData.title,
-    status: 'playing',
-    message: 'Reprodução iniciada.',
-  });
-});
-
-// GET /streaming/sessions — listar sessões do usuário
-app.get('/streaming/sessions', async (request) => {
-  const userId = request.headers['x-user-id'] || 'anonymous';
-  return db.prepare('SELECT * FROM sessions WHERE user_id = ? ORDER BY started_at DESC').all(userId);
 });
 
 // GET /health
 app.get('/health', async () => ({
   status: 'ok',
   service: 'streaming-service',
-  uptime: process.uptime(),
-  timestamp: new Date().toISOString(),
+  rabbitmq_connected: !!amqpChannel,
+  timestamp: new Date().toISOString()
 }));
 
 // ── Inicialização ───────────────────────────────────────────
-app.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
-  if (err) { app.log.error(err); process.exit(1); }
-  app.log.info(`streaming-service rodando na porta ${PORT}`);
+const start = async () => {
+  try {
+    await app.listen({ port: PORT, host: '0.0.0.0' });
+    app.log.info(`streaming-service rodando na porta ${PORT}`);
+    
+    // Inicia o produtor RabbitMQ
+    await connectRabbitMQ();
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+};
+
+// Shutdown gracioso
+process.on('SIGTERM', () => {
+  sdk.shutdown()
+    .then(() => console.log('SDK de Tracing do Streaming finalizado'))
+    .finally(() => process.exit(0));
 });
+
+start();

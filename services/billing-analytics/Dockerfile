@@ -8,9 +8,8 @@ COPY services/streaming/package*.json ./services/streaming/
 COPY services/recommendation/package*.json ./services/recommendation/
 COPY services/billing-analytics/package*.json ./services/billing-analytics/
 RUN npm install --omit=dev
-COPY gateway/ ./gateway/
-COPY keys/ ./keys/
+COPY services/billing-analytics/ ./services/billing-analytics/
 ENV NODE_PATH=/app/node_modules
-WORKDIR /app/gateway
-EXPOSE 8080
+WORKDIR /app/services/billing-analytics
+EXPOSE 3006
 CMD ["node", "--preserve-symlinks", "index.js"]

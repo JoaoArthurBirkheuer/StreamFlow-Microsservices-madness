@@ -1,157 +1,117 @@
-# StreamFlow — Plataforma de Streaming (Arquitetura de Microsserviços)
-# Disciplina: Serviços Web (PF_CC.44) — IFSul, Campus Passo Fundo
-#
-# Para subir todos os serviços:
-#   docker compose up --build
-#
-# Para ver logs de um serviço específico:
-#   docker compose logs -f <nome-do-servico>
-
+version: '3.8'
 services:
-  # ── API Gateway ──────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: streamflow-rabbitmq
+    ports: ["5672:5672", "15672:15672"]
+    networks: [streamflow-net]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: streamflow-jaeger
+    ports: ["16686:16686", "4318:4318"]
+    networks: [streamflow-net]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: streamflow-prometheus
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml"]
+    ports: ["9090:9090"]
+    networks: [streamflow-net]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: streamflow-grafana
+    ports: ["3000:3000"]
+    networks: [streamflow-net]
+
   gateway:
-    build: ./gateway
-    ports:
-      - "8080:8080"
-    depends_on:
-      - auth-service
-      - catalog-service
-      - streaming-service
-      - recommendation-service
-      - notification-service
-      - billing-service
-      - analytics-service
+    build: { context: ., dockerfile: gateway/Dockerfile }
+    container_name: streamflow-gateway
+    ports: ["8080:8080"]
+    depends_on: [auth-service, catalog-service]
     environment:
       - PORT=8080
       - AUTH_SERVICE_URL=http://auth-service:3001
       - CATALOG_SERVICE_URL=http://catalog-service:3002
       - STREAMING_SERVICE_URL=http://streaming-service:3003
       - RECOMMENDATION_SERVICE_URL=http://recommendation-service:3004
-      - NOTIFICATION_SERVICE_URL=http://notification-service:3005
       - BILLING_SERVICE_URL=http://billing-service:3006
-      - ANALYTICS_SERVICE_URL=http://analytics-service:3007
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
       - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
-    volumes:
-      - ./keys:/app/keys:ro
-    networks:
-      - streamflow-net
+    volumes: ["./keys:/app/keys:ro"]
+    networks: [streamflow-net]
 
-  # ── Auth Service ─────────────────────────────────────────────
   auth-service:
-    build: ./services/auth
-    expose:
-      - "3001"
+    build: { context: ., dockerfile: services/auth/Dockerfile }
+    container_name: streamflow-auth
     environment:
       - PORT=3001
       - DB_PATH=/app/data/auth.db
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
       - JWT_PRIVATE_KEY_PATH=/app/keys/private.pem
-    volumes:
-      - auth-data:/app/data
-      - ./keys:/app/keys:ro
-    networks:
-      - streamflow-net
+    volumes: ["auth-data:/app/data", "./keys:/app/keys:ro"]
+    networks: [streamflow-net]
 
-  # ── Catalog Service ──────────────────────────────────────────
   catalog-service:
-    build: ./services/catalog
-    expose:
-      - "3002"
+    build: { context: ., dockerfile: services/catalog/Dockerfile }
+    container_name: streamflow-catalog
     environment:
       - PORT=3002
       - DB_PATH=/app/data/catalog.db
-      - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
-    volumes:
-      - catalog-data:/app/data
-      - ./keys:/app/keys:ro
-    networks:
-      - streamflow-net
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+    volumes: ["catalog-data:/app/data"]
+    networks: [streamflow-net]
 
-  # ── Streaming Service ────────────────────────────────────────
   streaming-service:
-    build: ./services/streaming
-    expose:
-      - "3003"
+    build: { context: ., dockerfile: services/streaming/Dockerfile }
+    container_name: streamflow-streaming
+    depends_on:
+      rabbitmq: { condition: service_healthy }
     environment:
       - PORT=3003
       - DB_PATH=/app/data/streaming.db
+      - RABBITMQ_URL=amqp://rabbitmq:5672
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
       - CATALOG_SERVICE_URL=http://catalog-service:3002
-      - RECOMMENDATION_SERVICE_URL=http://recommendation-service:3004
-      - NOTIFICATION_SERVICE_URL=http://notification-service:3005
-      - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
-    volumes:
-      - streaming-data:/app/data
-      - ./keys:/app/keys:ro
-    networks:
-      - streamflow-net
+    volumes: ["streaming-data:/app/data"]
+    networks: [streamflow-net]
 
-  # ── Recommendation Service ───────────────────────────────────
   recommendation-service:
-    build: ./services/recommendation
-    expose:
-      - "3004"
+    build: { context: ., dockerfile: services/recommendation/Dockerfile }
+    container_name: streamflow-recommendation
+    depends_on:
+      rabbitmq: { condition: service_healthy }
     environment:
       - PORT=3004
       - DB_PATH=/app/data/recommendation.db
-      - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
-    volumes:
-      - recommendation-data:/app/data
-      - ./keys:/app/keys:ro
-    networks:
-      - streamflow-net
+      - RABBITMQ_URL=amqp://rabbitmq:5672
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+    volumes: ["recommendation-data:/app/data"]
+    networks: [streamflow-net]
 
-  # ── Notification Service ─────────────────────────────────────
-  # NOTA: Este serviço NÃO possui banco de dados próprio.
-  #       Ele é chamado de forma síncrona no fluxo de play.
-  notification-service:
-    build: ./services/notification
-    expose:
-      - "3005"
-    environment:
-      - PORT=3005
-    networks:
-      - streamflow-net
-
-  # ── Billing Service ──────────────────────────────────────────
   billing-service:
-    build: ./services/billing
-    expose:
-      - "3006"
+    build: { context: ., dockerfile: services/billing-analytics/Dockerfile }
+    container_name: streamflow-billing
     environment:
       - PORT=3006
       - DB_PATH=/app/data/shared_billing.db
-      - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
-    volumes:
-      - shared-billing-data:/app/data
-      - ./keys:/app/keys:ro
-    networks:
-      - streamflow-net
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+    volumes: ["shared-billing-data:/app/data"]
+    networks: [streamflow-net]
 
-  # ── Analytics Service ────────────────────────────────────────
-  # NOTA: Este serviço compartilha o MESMO volume de dados
-  #       do billing-service (shared-billing-data).
-  analytics-service:
-    build: ./services/analytics
-    expose:
-      - "3007"
-    environment:
-      - PORT=3007
-      - DB_PATH=/app/data/shared_billing.db
-      - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
-    volumes:
-      - shared-billing-data:/app/data
-      - ./keys:/app/keys:ro
-    networks:
-      - streamflow-net
+networks:
+  streamflow-net:
+    driver: bridge
 
-# ── Volumes ──────────────────────────────────────────────────
 volumes:
   auth-data:
   catalog-data:
   streaming-data:
   recommendation-data:
-  shared-billing-data:   # Compartilhado entre billing e analytics
-
-# ── Rede interna ─────────────────────────────────────────────
-networks:
-  streamflow-net:
-    driver: bridge
+  shared-billing-data:
